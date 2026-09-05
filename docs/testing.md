@@ -57,6 +57,31 @@ Or through tox (same result, isolated env):
 tox -e py
 ```
 
+#### In-container (docker or podman)
+
+The `Dockerfile` `dev` target installs the dev extras
+(`requirements-dev.txt`, incl. `pytest`) and copies `src/` + `tests/`, so the
+entire suite runs inside the container with zero local setup. `podman` is
+auto-detected and preferred; `docker` is the fallback.
+
+```bash
+./scripts/container-test.sh test    # build (cached) + pytest, or
+make container-test
+
+./scripts/container-test.sh build   # build only the dev image
+make container-build
+```
+
+`src/` and `tests/` are bind-mounted read-only into the container, so local
+edits are exercised without a rebuild. To force an engine:
+
+```bash
+CONTAINER_ENGINE=podman ./scripts/container-test.sh test
+make container-test CONTAINER_ENGINE=docker
+```
+
+Works out of the box with rootless podman.
+
 ### 2. Lint + format (ruff)
 
 ```bash

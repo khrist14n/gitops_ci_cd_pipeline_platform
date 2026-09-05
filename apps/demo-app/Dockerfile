@@ -4,6 +4,14 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
+FROM python:3.12-slim AS dev
+WORKDIR /app
+COPY requirements.txt requirements-dev.txt .
+RUN pip install --no-cache-dir -r requirements-dev.txt
+ENV PYTHONUNBUFFERED=1
+COPY src/ src/
+COPY tests/ tests/
+
 FROM python:3.12-slim AS runtime
 RUN useradd --create-home --uid 10001 appuser
 WORKDIR /app
