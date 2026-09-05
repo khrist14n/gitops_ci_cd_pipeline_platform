@@ -1,0 +1,35 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: gitops-platform
+  namespace: argocd
+spec:
+  description: Platform-managed applications delivered via GitOps
+  sourceRepos:
+    - 'https://github.com/example/gitops_ci_cd_pipeline_platform'
+    - 'ghcr.io/example/**'
+  destinations:
+    - namespace: 'demo-app-*'
+      server: 'https://kubernetes.default.svc'
+  clusterResourceWhitelist:
+    - group: ''
+      kind: Namespace
+  namespaceResourceBlacklist:
+    - group: rbac.authorization.k8s.io
+      kind: '*'
+  roles:
+    - name: deploy-operator
+      description: Promote and roll back applications
+      policies:
+        - p, proj:gitops-platform:deploy-operator, applications, sync, gitops-platform/*, allow
+        - p, proj:gitops-platform:deploy-operator, applications, rollback, gitops-platform/*, allow
+      groups:
+        - github:platform-deploy-bot
+  syncWindows:
+    # Block destructive prod syncs outside working hours except during incidents.
+    - kind: deny
+      schedule: '0 22 * * *'
+      duration: 6h
+      applications: ['*-prod']
+      namespaces: ['-prod']
+      clusters: ['*']

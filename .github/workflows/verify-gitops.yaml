@@ -1,0 +1,85 @@
+name: verify-gitops
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'charts/**'
+      - 'gitops/**'
+      - 'infra/argocd/**'
+
+permissions:
+  contents: read
+
+jobs:
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+
+      - name: lint all charts
+        run: |
+          for chart in charts/*/; do
+            helm lint "$chart"
+          done
+
+      - name: render every environment overlay against chart
+        run: |
+          # Cross-product: each app overlay x each env values file must produce
+          # a valid manifest set (catches typos before they merge to main).
+          for chart in charts/*/; do
+            chart_name=$(basename "$chart")
+            app_map="${chart_name//-/_}"   # demo-app -> demo_app (heuristic)
+            for env in gitops/environments/*.yaml; do
+              env_name=$(basename "$env" .yaml)
+              helm template "$chart_name" "$chart" -f "$env" \
+                --set-string image.repository="ghcr.io/example/$chart_name" \
+                > /tmp/render-$chart_name-$env_name.yaml
+              echo "rendered $chart_name/$env_name OK"
+            done
+          done
+
+      - name: diff promotion PRs are image-pins only
+        if: ${{ github.event_name == 'pull_request' }}
+        run: |
+          set -euo pipefail
+          base=origin/${{ github.event.pull_request.base.ref }}
+          head=${{ github.event.pull_request.head.sha }}
+          files=$(git diff --name-only "$base..$head" -- gitops/)
+          for f in $files; do
+            if [[ "$f" != gitops/environments/*.yaml ]]; then
+              echo "unexpected change outside gitops/environments: $f" >&2
+              exit 1
+            fi
+            git diff "$base..$head" -- "$f" | python3 - <<'PY'
+            import sys
+
+            allowed = ("image", "tag", "digest", "repository", "pullPolicy")
+            changed_lines = []
+            for line in sys.stdin:
+                if line.startswith(("+", "-")) and not line.startswith(("+++", "---")):
+                    key = line[1:].split(":", 1)[0].strip()
+                    changed_lines.append(line.rstrip())
+                    if key not in allowed:
+                        print(f"disallowed change to key: {key!r} in {line.rstrip()!r}", file=sys.stderr)
+                        sys.exit(1)
+            print(f"allowed image-pin changes: {len(changed_lines)} line(s)")
+            PY
+          done
+
+  argocd-manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: validate ApplicationSet app inputs
+        run: |
+          python3 - <<'PY'
+          import glob, yaml, re
+          for f in glob.glob("gitops/applications/**/*.yaml", recursive=True):
+              doc = yaml.safe_load(open(f))
+              assert re.fullmatch(r"[a-z0-9][a-z0-9-]*", doc["app"]), f
+              assert doc["env"] in {"dev", "staging", "prod"}, f
+              assert doc["destNamespace"].startswith(f"{doc['app']}-"), f
+          print("application descriptors OK")
+          PY

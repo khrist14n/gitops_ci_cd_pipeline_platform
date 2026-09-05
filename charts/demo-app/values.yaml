@@ -1,0 +1,106 @@
+replicaCount: 2
+
+image:
+  repository: ghcr.io/example/demo-app
+  pullPolicy: IfNotPresent
+  tag: ""
+  digest: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+    add: ["NET_BIND_SERVICE"]
+
+podSecurityContext:
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+ingress:
+  enabled: false
+  className: nginx
+  hosts:
+    - host: demo-app.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+configMap:
+  enabled: false
+  data: {}
+
+env: []
+
+telemetry:
+  newrelic:
+    enabled: false
+    appNameOverride: ""
+    logLevel: info
+    distributedTracingEnabled: true
+    logForwardingEnabled: true
+    licenseKeySecret:
+      name: newrelic-license-key
+      key: NEW_RELIC_LICENSE_KEY
+
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  path: /metrics
+
+progressiveDelivery:
+  enabled: false
+  strategy:
+    canary:
+      steps:
+        - setWeight: 10
+        - pause: { duration: 30s }
+        - setWeight: 50
+        - pause: { duration: 30s }
+        - setWeight: 100
+  analysis:
+    interval: 15s
+    successCondition: 'result[0] < 0.01'
+    errorRateThreshold: "0.01"
+    prometheus: http://prometheus-operated.monitoring.svc:9090

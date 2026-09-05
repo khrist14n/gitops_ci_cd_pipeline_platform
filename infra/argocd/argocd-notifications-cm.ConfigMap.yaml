@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-notifications-cm
+  namespace: argocd
+data:
+  service.slack: |
+    token: $slack-token
+    username: argocd
+  service.github: |
+    token: $github-token
+  template.app-deployed: |
+    message: Application {{.app.metadata.name}} is now running new version.
+  trigger.on-deployed: |
+    - description: Application is fully deployed
+      send:
+        - github-pr: app deployed
+        - slack: app-deployed
+      when: app.status.health.status == 'Healthy'

@@ -1,0 +1,29 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/example/demo-app
+  pullPolicy: IfNotPresent
+  tag: latest
+  digest: ""
+
+autoscaling:
+  enabled: false
+
+podDisruptionBudget:
+  enabled: false
+
+serviceMonitor:
+  enabled: true
+  interval: 30s
+
+# Developer sandbox: allow quick iterations, no progressive delivery.
+progressiveDelivery:
+  enabled: false
+
+resources:
+  limits:
+    cpu: 250m
+    memory: 128Mi
+  requests:
+    cpu: 50m
+    memory: 64Mi

@@ -1,0 +1,85 @@
+name: rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: Application to roll back
+        required: true
+      env:
+        description: Target environment (dev|staging|prod)
+        required: true
+      reason:
+        description: Why this rollback is happening
+        required: false
+        default: manual
+  repository_dispatch:
+    types: [rollback-request]
+
+concurrency:
+  group: rollback-${{ inputs.app || github.event.client_payload.app }}-${{ inputs.env || github.event.client_payload.env }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+  issues: write
+
+env:
+  APP: ${{ inputs.app || github.event.client_payload.app }}
+  ENV: ${{ inputs.env || github.event.client_payload.env }}
+  REASON: ${{ inputs.reason || github.event.client_payload.reason || 'manual' }}
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITOPS_PAT }}
+      ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+      ARGOCD_SERVER: ${{ vars.ARGOCD_SERVER || 'argocd.example.com' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITOPS_PAT }}
+
+      - name: revert overlay to previous state
+        run: |
+          ./scripts/rollback.sh "$APP" "$ENV" --to-previous
+
+      - name: open + merge rollback PR (idempotent revert commit)
+        run: |
+          git push -u origin "rollback/$APP-$ENV" --force
+          URL=$(gh pr create --base main --head "rollback/$APP-$ENV" \
+            --title "rollback ${APP}/${ENV}: ${REASON}" \
+            --label rollback --body "See [runbook](docs/runbook.md). Reason: **${REASON}**.")
+          echo "$URL"
+          gh pr merge "rollback/$APP-$ENV" --squash --delete-branch
+
+      - name: force resync ArgoCD to the reverted state
+        run: |
+          argocd app get "${APP}-${ENV}" --refresh >/dev/null || true
+          argocd app sync "${APP}-${ENV}" --force
+
+      - name: confirm health after rollback
+        timeout-minutes: 5
+        run: |
+          for i in $(seq 1 30); do
+            state=$(argocd app get "${APP}-${ENV}" -o json)
+            health=$(echo "$state" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"]["health"]["status"])')
+            echo "[$i] health=$health"
+            [[ "$health" == "Healthy" ]] && { echo "ROLLBACK_COMPLETE" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+            sleep 10
+          done
+          echo "rollback did not converge to Healthy" >&2
+          exit 1
+
+      - name: close related incident issue
+        if: github.event_name == 'repository_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_PAT }}
+        run: |
+          gh issue list --label incident --search "${APP}/${ENV} failed health gate" \
+            --state open --json number --jq '.[] | .number' --repo "${{ github.repository }}" |
+            xargs -r -I{} gh issue close {} --comment "rolled back for **${REASON}**" --repo "${{ github.repository }}"

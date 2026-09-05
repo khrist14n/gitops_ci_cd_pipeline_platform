@@ -1,0 +1,97 @@
+{{- if .Values.progressiveDelivery.enabled }}
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: {{ include "demo-app.fullname" . }}
+  labels:
+    {{- include "demo-app.labels" . | nindent 4 }}
+spec:
+  revisionHistoryLimit: 10
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "demo-app.selectorLabels" . | nindent 6 }}
+  strategy:
+    canary:
+      steps:
+        {{- toYaml .Values.progressiveDelivery.strategy.canary.steps | nindent 8 }}
+      analysis:
+        templates:
+          - templateName: {{ include "demo-app.fullname" . }}-analysis
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "demo-app.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "demo-app.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ include "demo-app.image" . }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+              protocol: TCP
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          env:
+            - name: APP_VERSION
+              value: {{ .Chart.AppVersion | quote }}
+            {{- include "demo-app.newrelicEnv" . | nindent 12 }}
+            {{- with .Values.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: {{ include "demo-app.fullname" . }}-analysis
+  labels:
+    {{- include "demo-app.labels" . | nindent 4 }}
+spec:
+  metrics:
+    - name: error-rate
+      interval: {{ .Values.progressiveDelivery.analysis.interval }}
+      successCondition: {{ quote .Values.progressiveDelivery.analysis.successCondition }}
+      failureCondition: {{ printf "result[0] >= %s" .Values.progressiveDelivery.analysis.errorRateThreshold | quote }}
+      provider:
+        prometheus:
+          address: {{ .Values.progressiveDelivery.analysis.prometheus }}
+          query: |
+            sum(rate(
+              http_requests_total{job="{{ include "demo-app.name" . }}", status=~"5.."}[2m]
+            )) / clamp_min(sum(rate(
+              http_requests_total{job="{{ include "demo-app.name" . }}"}[2m]
+            )), 1)
+{{- end }}

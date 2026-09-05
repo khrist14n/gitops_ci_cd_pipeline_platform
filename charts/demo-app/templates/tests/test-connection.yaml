@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "demo-app.fullname" . }}-test-connection"
+  labels:
+    {{- include "demo-app.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+spec:
+  containers:
+    - name: wget
+      image: busybox:1.36
+      command:
+        - wget
+        - --spider
+        - --timeout=5
+        - "{{ include "demo-app.fullname" . }}:{{ .Values.service.port }}/readyz"
+  restartPolicy: Never

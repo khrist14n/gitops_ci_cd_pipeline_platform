@@ -1,0 +1,21 @@
+repos:
+  # Python lint + format (see [tool.ruff] in pyproject.toml).
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.6
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  # Generic hygiene hooks.
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-merge-conflict
+      - id: check-yaml
+        # Helm templates carry Go template syntax ({{ .Values.x }}); they are
+        # not valid YAML until rendered. They are validated by `helm lint`
+        # and `helm template` instead.
+        exclude: 'charts/.*/templates/'

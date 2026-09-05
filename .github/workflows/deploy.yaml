@@ -1,0 +1,152 @@
+name: deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: Application to promote
+        required: true
+      env:
+        description: Target environment (dev|staging|prod)
+        required: true
+      image_ref:
+        description: Image tag or digest (defaults to latest CI build)
+        required: false
+  repository_dispatch:
+    types: [deploy]
+
+concurrency:
+  # ONE deploy per (app, env) at a time — the guarantee that keeps 200+/day
+  # commits from ever interleaving state. Different apps/envs still run in parallel.
+  group: deploy-${{ inputs.app || github.event.client_payload.app }}-${{ inputs.env || github.event.client_payload.env }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+  issues: write
+
+env:
+  APP: ${{ inputs.app || github.event.client_payload.app }}
+  ENV: ${{ inputs.env || github.event.client_payload.env }}
+  IMAGE_REF: ${{ inputs.image_ref || github.event.client_payload.image_ref }}
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: validate inputs
+        run: |
+          : "${APP:?app is required}"
+          case "$ENV" in dev|staging|prod) ;; *) echo "invalid env: $ENV" >&2; exit 1;; esac
+          echo "deploying $APP to $ENV"
+
+  promote:
+    needs: verify
+    runs-on: ubuntu-latest
+    outputs:
+      branch: ${{ steps.pr.outputs.branch }}
+      image: ${{ steps.pinnage.outputs.image }}
+      pr-url: ${{ steps.pr.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITOPS_PAT }}
+
+      - name: promote image pin to overlay
+        id: promote
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          ./scripts/promote-image.sh "$APP" "$ENV" "$IMAGE_REF"
+          echo "branch=$(git branch --show-current)" >> "$GITHUB_OUTPUT"
+
+      - name: extract pinned image
+        id: pinnage
+        run: |
+          img=$(python3 -c 'import yaml,os; d=yaml.safe_load(open(f"gitops/environments/{os.environ[\"ENV\"]}.yaml"))["image"]; print((d["repository"]+"@"+d["digest"]) if d.get("digest") else (d["repository"]+":"+d["tag"]))')
+          echo "image=$img" >> "$GITHUB_OUTPUT"
+
+      - name: open promotion PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_PAT }}
+        run: |
+          git push -u origin "$(git branch --show-current)" --force
+          URL=$(gh pr create --base main --head "$(git branch --show-current)" \
+            --title "promote ${APP} → ${ENV}" \
+            --body "Pinning image **${IMAGE}** to **${ENV}** for **${APP}**." \
+            --label deployment)
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "branch=$(git branch --show-current)" >> "$GITHUB_OUTPUT"
+
+  gate-and-merge:
+    needs: [promote]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITOPS_PAT }}
+      ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+      ARGOCD_SERVER: ${{ vars.ARGOCD_SERVER || 'argocd.example.com' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: wait for PR checks and merge
+        timeout-minutes: 15
+        run: |
+          # Wait until all required checks (verify-gitops, ci) pass.
+          gh pr checks "promotion/${APP}-${ENV}" --watch --interval 15 --repo "${{ github.repository }}"
+          gh pr merge "promotion/${APP}-${ENV}" --squash --delete-branch --repo "${{ github.repository }}"
+
+      - name: configure cluster access (OIDC short-lived creds)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gitops-deploy
+
+      - name: sync + health gate
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          # 1) wait for ArgoCD to observe the new git state
+          argocd app get "${APP}-${ENV}" --refresh >/dev/null 2>&1 || true
+          # 2) poll until synced & healthy (approximate the promoted image too)
+          for i in $(seq 1 60); do
+            state=$(argocd app get "${APP}-${ENV}" -o json)
+            sync=$(echo "$state" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"]["sync"]["status"])')
+            health=$(echo "$state" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"]["health"]["status"])')
+            echo "[$i] sync=$sync health=$health"
+            if [[ "$sync" == "Synced" && "$health" == "Healthy" ]]; then
+              echo "DEPLOY_OK" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "deployment did not reach Healthy in time" >&2
+          exit 1
+
+  auto-rollback:
+    needs: gate-and-merge
+    if: ${{ failure() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - run: echo "triggering automated rollback for ${APP}/${ENV}"
+      - name: dispatch rollback workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_PAT }}
+        run: |
+          gh workflow run rollback.yaml \
+            -f app="$APP" -f env="$ENV" -f reason="health-gate-failure" \
+            --repo "${{ github.repository }}"
+      - name: open follow-up issue
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_PAT }}
+        run: |
+          gh issue create \
+            --title "[rollback] ${APP}/${ENV} failed health gate" \
+            --body "Automated rollback triggered for **${APP}**/**${ENV}** after the post-deploy health gate timed out." \
+            --label incident --repo "${{ github.repository }}"

@@ -1,0 +1,6 @@
+app: demo-app
+env: prod
+chartPath: charts/demo-app
+targetRevision: main
+destNamespace: demo-app-prod
+valuesFile: gitops/environments/prod.yaml

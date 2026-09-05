@@ -1,0 +1,17 @@
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# E errors, F pyflakes, I import order, UP pyupgrade, B bugbear
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# `app.py` intentionally imports fastapi/uvicorn AFTER initializing the
+# New Relic agent (agent hooks must fire before the frameworks load).
+# This is enforced/guarded by design — ruff must not reorder those imports.
+"apps/demo-app/src/app.py" = ["E402", "I001"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

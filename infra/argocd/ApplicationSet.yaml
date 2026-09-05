@@ -1,0 +1,52 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: gitops-platform
+  namespace: argocd
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    # One (app, environment) pair per file under gitops/applications/**.
+    - git:
+        repoURL: https://github.com/example/gitops_ci_cd_pipeline_platform
+        revision: main
+        files:
+          - path: gitops/applications/**/*.yaml
+  template:
+    metadata:
+      name: '{{ .app }}-{{ .env }}'
+      namespace: argocd
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+      annotations:
+        notifications.argoproj.io/subscribe.on-sync-succeeded.alertmanager: ''
+        notifications.argoproj.io/subscribe.on-deployed.alertmanager: ''
+    spec:
+      project: gitops-platform
+      source:
+        repoURL: https://github.com/example/gitops_ci_cd_pipeline_platform
+        targetRevision: '{{ .targetRevision }}'
+        path: '{{ .chartPath }}'
+        helm:
+          valueFiles:
+            - '{{ .valuesFile }}'
+          ignoreMissingValueFiles: false
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: '{{ .destNamespace }}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+          allowEmpty: false
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true
+          - Replace=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m

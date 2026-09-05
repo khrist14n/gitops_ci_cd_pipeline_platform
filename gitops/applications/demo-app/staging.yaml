@@ -1,0 +1,6 @@
+app: demo-app
+env: staging
+chartPath: charts/demo-app
+targetRevision: main
+destNamespace: demo-app-staging
+valuesFile: gitops/environments/staging.yaml

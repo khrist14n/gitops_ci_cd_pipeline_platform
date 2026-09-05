@@ -1,0 +1,71 @@
+name: drift-detect
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # every 30 minutes
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    env:
+      ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+      ARGOCD_SERVER: ${{ vars.ARGOCD_SERVER || 'argocd.example.com' }}
+      GH_TOKEN: ${{ secrets.GH_PAT }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: list managed applications
+        id: apps
+        run: |
+          apps=$(argocd app list -o json | \
+            python3 -c 'import json,sys; print(" ".join(a["metadata"]["name"] for a in json.load(sys.stdin)))')
+          echo "apps=$apps" >> "$GITHUB_OUTPUT"
+
+      - name: scan for drift
+        id: scan
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import subprocess
+
+          apps = "${APPS}".split()
+          drifted = []
+          for app in apps:
+              state = subprocess.run(
+                  ["argocd", "app", "get", app, "-o", "json"],
+                  capture_output=True, text=True, check=True,
+              ).stdout
+              d = json.loads(state)
+              s = d["status"]["sync"]
+              if s["status"] != "Synced" or d["status"]["health"]["status"] != "Healthy":
+                  drifted.append(app)
+          pathlib.Path("/tmp/drift.txt").write_text("\n".join(drifted))
+          print(f"drifted: {len(drifted)} -> {drifted or 'none'}")
+          PY
+          echo "drifted=$([[ -s /tmp/drift.txt ]] && echo 1 || echo 0)" >> "$GITHUB_OUTPUT"
+        env:
+          APPS: ${{ steps.apps.outputs.apps }}
+
+      - name: self-heal drifted apps
+        if: steps.scan.outputs.drifted == '1'
+        run: |
+          while read -r app; do
+            echo "resyncing $app"
+            argocd app sync "$app" --force || true
+          done < /tmp/drift.txt
+
+      - name: escalate if drift persists
+        if: steps.scan.outputs.drifted == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          gh issue create \
+            --title "[drift] count=${{ steps.scan.outputs.drifted }} apps out of sync" \
+            --body "$(cat /tmp/drift.txt)" --label incident --repo "${{ github.repository }}" || true

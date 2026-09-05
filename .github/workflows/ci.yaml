@@ -1,0 +1,183 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    paths: ['apps/**']
+  pull_request:
+    branches: [main]
+    paths: ['apps/**']
+
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+  contents: read
+  packages: write
+  security-events: write
+
+env:
+  REGISTRY: ghcr.io
+  REGISTRY_USER: ${{ github.actor }}
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      apps: ${{ steps.list.outputs.apps }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: enumerate apps
+        id: list
+        run: |
+          apps=$(for d in apps/*/; do
+            [ -f "${d}Dockerfile" ] && printf '%s\n' "$(basename "$d")"
+          done | jq -R -s -c 'split("\n")[:-1]')
+          echo "apps=$apps" >> "$GITHUB_OUTPUT"
+          echo "found apps: $apps"
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bootstrap python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: install tox
+        run: pip install tox
+      # Same gate a developer runs locally: `tox -e lint`.
+      - name: ruff lint + format check
+        run: tox -e lint
+
+  charts:
+    runs-on: ubuntu-latest
+    if: ${{ !failure() }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: lint all charts
+        run: |
+          for chart in charts/*/; do
+            helm lint "$chart"
+            helm template "${chart%/}" \
+              --set image.tag='sha-ci' \
+              --set image.repository="ghcr.io/${{ github.repository_owner }}/$(basename "$chart")" \
+              > /tmp/$(basename "$chart").yaml
+          done
+
+  build:
+    needs: detect
+    if: ${{ needs.detect.outputs.apps != '[]' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app: ${{ fromJson(needs.detect.outputs.apps) }}
+    outputs:
+      digests: ${{ steps.digests.outputs.digests }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: compute image reference
+        id: meta
+        run: |
+          short="${GITHUB_SHA::12}"
+          tag="sha-${short}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: bootstrap python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: apps/${{ matrix.app }}/requirements.txt
+
+      - name: unit tests
+        working-directory: apps/${{ matrix.app }}
+        run: |
+          pip install -r requirements-dev.txt
+          python -m pytest tests -q
+
+      - name: set up buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: OIDC login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ env.REGISTRY_USER }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: build and push (cached)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: apps/${{ matrix.app }}
+          file: apps/${{ matrix.app }}/Dockerfile
+          push: ${{ github.event_name == 'push' }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.app }}:${{ steps.meta.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.app }}:latest
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.app }}:buildcache
+          cache-to: type=registry,mode=max,ref=${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.app }}:buildcache
+          sbom: true
+          provenance: mode=max
+
+      - name: generate SBOM
+        if: github.event_name == 'push'
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.app }}:${{ steps.meta.outputs.tag }}
+          format: spdx-json
+          output: ${{ matrix.app }}-sbom.spdx.json
+
+      - name: upload SBOM artifact
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ matrix.app }}
+          path: ${{ matrix.app }}-sbom.spdx.json
+
+      - name: vulnerability gate
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.app }}:${{ steps.meta.outputs.tag }}
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+          ignore-unfixed: true
+          format: sarif
+          output: trivy-results.sarif
+
+      - name: upload scan results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: emit digests
+        id: digests
+        if: github.event_name == 'push'
+        run: |
+          d=$(docker buildx imagetools inspect \
+            --format '{{ .Manifest.Digest }}' \
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.app }}:${{ steps.meta.outputs.tag }})
+          echo "digest=$d" >> "$GITHUB_OUTPUT"
+          echo "${{ matrix.app }}=${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.app }}@${d}" \
+            >> "$GITHUB_ENV"
+
+      - name: generate image-reference artifact
+        if: github.event_name == 'push'
+        working-directory: apps/${{ matrix.app }}
+        run: |
+          echo "tag=${{ steps.meta.outputs.tag }}" > image-tag.txt
+          echo "digest=${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.app }}@${{ steps.digests.outputs.digest }}" >> image-tag.txt
+      - name: upload image-reference
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-ref-${{ matrix.app }}
+          path: apps/${{ matrix.app }}/image-tag.txt
+          retention-days: 14
